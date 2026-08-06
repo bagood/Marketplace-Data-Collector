@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Concatenate scraper CSV files and rate phone condition with Codex CLI."""
+"""Rate new scraper ads with Codex CLI and append them to the combined CSV."""
 
 from __future__ import annotations
 
 import argparse
 import csv
 import json
+import os
 import subprocess
 import tempfile
 from pathlib import Path
@@ -21,6 +22,19 @@ BASE_FIELDS = ("link", "title", "price", "description", "timestamp", "source")
 RATING_FIELDS = ("condition_rating", "condition_reason")
 OUTPUT_FIELDS = BASE_FIELDS + RATING_FIELDS
 VALID_RATINGS = {"Excellent", "Good", "Fair", "Poor", "Unknown"}
+
+
+def validate_codex_auth() -> None:
+    """Fail clearly when a Docker analysis has no API credentials."""
+    codex_home = Path(os.getenv("CODEX_HOME", Path.home() / ".codex"))
+    has_api_key = bool(os.getenv("OPENAI_API_KEY", "").strip())
+    has_cached_login = (codex_home / "auth.json").is_file()
+    if os.getenv("RUNNING_IN_DOCKER") == "1" and not (has_api_key or has_cached_login):
+        raise RuntimeError(
+            "Codex is not authenticated in Docker. For ChatGPT Plus, run "
+            "'docker compose run --rm codex-login' and complete device sign-in. "
+            "Alternatively, set OPENAI_API_KEY in .env."
+        )
 
 
 def detect_delimiter(path: Path) -> str:
@@ -63,21 +77,41 @@ def read_source_rows(data_dir: Path, excluded_path: Path | None = None) -> list[
     return rows
 
 
-def load_cached_ratings(output: Path) -> dict[tuple[str, str, str], tuple[str, str]]:
+def ad_identity(row: dict[str, str]) -> str:
+    """Return the stable identity used to determine whether an ad was rated."""
+    return row.get("link", "").strip()
+
+
+def load_existing_identities(output: Path) -> set[str]:
+    """Load every ad already present in the combined output."""
     if not output.exists() or output.stat().st_size == 0:
-        return {}
-    cache: dict[tuple[str, str, str], tuple[str, str]] = {}
+        return set()
+    identities: set[str] = set()
     with output.open("r", encoding="utf-8-sig", newline="") as file:
-        for row in csv.DictReader(file, delimiter="|"):
-            rating = row.get("condition_rating", "")
-            if rating in VALID_RATINGS:
-                key = (
-                    row.get("source", ""),
-                    row.get("link", ""),
-                    row.get("description", ""),
-                )
-                cache[key] = (rating, row.get("condition_reason", ""))
-    return cache
+        reader = csv.DictReader(file, delimiter="|")
+        required = {"source", "link"}
+        missing = required - set(reader.fieldnames or ())
+        if missing:
+            raise RuntimeError(
+                f"{output.name} is missing columns: {', '.join(sorted(missing))}"
+            )
+        for row in reader:
+            identities.add(ad_identity(row))
+    return identities
+
+
+def select_new_rows(
+    source_rows: list[dict[str, str]], existing: set[str]
+) -> list[dict[str, str]]:
+    """Return unique source ads whose identities are absent from the output."""
+    seen = set(existing)
+    new_rows: list[dict[str, str]] = []
+    for row in source_rows:
+        identity = ad_identity(row)
+        if identity not in seen:
+            seen.add(identity)
+            new_rows.append(row)
+    return new_rows
 
 
 def build_prompt(guidelines: str, batch: list[dict[str, object]]) -> str:
@@ -149,13 +183,38 @@ def rate_batch_with_codex(
     return ratings
 
 
-def write_output(output: Path, rows: list[dict[str, str]]) -> None:
+def append_output(output: Path, rows: list[dict[str, str]]) -> None:
+    """Append newly rated rows, creating the output and header when necessary."""
+    if not rows:
+        return
     output.parent.mkdir(parents=True, exist_ok=True)
+    normalize_output_schema(output)
+    needs_header = not output.exists() or output.stat().st_size == 0
+    with output.open("a", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=OUTPUT_FIELDS, delimiter="|")
+        if needs_header:
+            writer.writeheader()
+        writer.writerows(rows)
+
+
+def normalize_output_schema(output: Path) -> None:
+    """Atomically upgrade an older combined CSV header before appending."""
+    if not output.exists() or output.stat().st_size == 0:
+        return
+    with output.open("r", encoding="utf-8-sig", newline="") as file:
+        reader = csv.DictReader(file, delimiter="|")
+        if tuple(reader.fieldnames or ()) == OUTPUT_FIELDS:
+            return
+        existing_rows = list(reader)
+
     temporary = output.with_suffix(output.suffix + ".tmp")
     with temporary.open("w", encoding="utf-8", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=OUTPUT_FIELDS, delimiter="|")
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows(
+            {field: row.get(field, "") for field in OUTPUT_FIELDS}
+            for row in existing_rows
+        )
     temporary.replace(output)
 
 
@@ -177,35 +236,34 @@ def main() -> None:
     if not args.guidelines.exists():
         raise SystemExit(f"Guidelines file not found: {args.guidelines}")
 
-    rows = read_source_rows(args.data_dir, excluded_path=args.output)
-    cache = load_cached_ratings(args.output)
-    pending: list[dict[str, object]] = []
-    pending_rows: dict[int, dict[str, str]] = {}
-
-    for row_id, row in enumerate(rows):
-        cached = cache.get((row["source"], row["link"], row["description"]))
-        if cached:
-            row["condition_rating"], row["condition_reason"] = cached
-        else:
-            pending.append({"row_id": row_id, "description": row["description"]})
-            pending_rows[row_id] = row
+    source_rows = read_source_rows(args.data_dir, excluded_path=args.output)
+    existing = load_existing_identities(args.output)
+    new_rows = select_new_rows(source_rows, existing)
 
     guidelines = args.guidelines.read_text(encoding="utf-8")
     print(
-        f"Loaded {len(rows)} rows from {args.data_dir}; "
-        f"{len(pending)} require Codex rating."
+        f"Loaded {len(source_rows)} source rows and {len(existing)} existing rated ads; "
+        f"{len(new_rows)} new ads require Codex rating."
     )
-    for start in range(0, len(pending), args.batch_size):
-        batch = pending[start : start + args.batch_size]
+    if new_rows:
+        validate_codex_auth()
+    for start in range(0, len(new_rows), args.batch_size):
+        batch_rows = new_rows[start : start + args.batch_size]
+        batch = [
+            {"row_id": row_id, "description": row["description"]}
+            for row_id, row in enumerate(batch_rows)
+        ]
         ratings = rate_batch_with_codex(batch, guidelines, args.model, args.timeout)
         for row_id, (rating, reason) in ratings.items():
-            pending_rows[row_id]["condition_rating"] = rating
-            pending_rows[row_id]["condition_reason"] = reason
-        write_output(args.output, rows)
-        print(f"Rated {min(start + len(batch), len(pending))}/{len(pending)} pending rows")
+            batch_rows[row_id]["condition_rating"] = rating
+            batch_rows[row_id]["condition_reason"] = reason
+        append_output(args.output, batch_rows)
+        print(f"Rated and appended {min(start + len(batch), len(new_rows))}/{len(new_rows)} new ads")
 
-    write_output(args.output, rows)
-    print(f"Saved {len(rows)} concatenated and rated rows to {args.output}")
+    if not new_rows:
+        print("No new ads to rate or append.")
+    else:
+        print(f"Appended {len(new_rows)} newly rated ads to {args.output}")
 
 
 if __name__ == "__main__":

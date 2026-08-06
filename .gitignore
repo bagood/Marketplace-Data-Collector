@@ -1,4 +1,5 @@
 .venv/
+.env
 .chrome-profile/
 .olx-chrome-profile/
 __pycache__/

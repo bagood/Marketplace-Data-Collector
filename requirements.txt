@@ -1,1 +1,4 @@
 selenium>=4.11,<5
+fastapi>=0.115,<1
+mcp>=1.26,<2
+uvicorn[standard]>=0.34,<1

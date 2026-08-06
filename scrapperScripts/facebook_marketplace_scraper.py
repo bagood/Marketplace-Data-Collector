@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import re
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -15,6 +16,7 @@ from urllib.parse import urljoin, urlparse
 from selenium import webdriver
 from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
@@ -27,14 +29,43 @@ ITEM_PATH_PATTERN = re.compile(r"^/marketplace/item/([^/?#]+)")
 PRICE_PATTERN = re.compile(r"^(?:Rp|IDR)\s*[\d.,]+", re.IGNORECASE)
 CSV_FIELDS = ("link", "title", "price", "description", "timestamp")
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
 
 
-def build_driver() -> webdriver.Chrome:
+def build_driver(headless: bool = False) -> webdriver.Chrome:
     options = Options()
+    chrome_binary = os.getenv("CHROME_BINARY")
+    chromedriver_path = os.getenv("CHROMEDRIVER_PATH")
+    if chrome_binary:
+        options.binary_location = chrome_binary
+    if headless:
+        options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-notifications")
     options.add_argument("--start-maximized")
     options.add_argument("--lang=en-US")
-    return webdriver.Chrome(options=options)
+    options.add_argument(f"user-agent={DEFAULT_USER_AGENT}")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
+    service = Service(executable_path=chromedriver_path) if chromedriver_path else None
+    driver = webdriver.Chrome(service=service, options=options)
+    driver.execute_cdp_cmd(
+        "Page.addScriptToEvaluateOnNewDocument",
+        {
+            "source": """
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined
+                })
+            """
+        },
+    )
+    return driver
 
 
 def collect_links(
@@ -91,6 +122,7 @@ def parse_args() -> argparse.Namespace:
         default=4,
         help="Chrome worker processes used to scrape ad details",
     )
+    parser.add_argument("--headless", action="store_true", help="Run Chrome headlessly")
     return parser.parse_args()
 
 
@@ -232,11 +264,13 @@ def append_csv_row(csv_output: Path, row: dict[str, str]) -> None:
         writer.writerow(row)
 
 
-def scrape_ad_chunk(links: list[str]) -> tuple[list[dict[str, str]], list[tuple[str, str]]]:
+def scrape_ad_chunk(
+    links: list[str], headless: bool = False
+) -> tuple[list[dict[str, str]], list[tuple[str, str]]]:
     """Scrape one link chunk in a dedicated process and Chrome instance."""
     rows: list[dict[str, str]] = []
     errors: list[tuple[str, str]] = []
-    driver = build_driver()
+    driver = build_driver(headless=headless)
     try:
         for link in links:
             try:
@@ -249,7 +283,7 @@ def scrape_ad_chunk(links: list[str]) -> tuple[list[dict[str, str]], list[tuple[
 
 
 def scrape_details_parallel(
-    links: list[str], workers: int
+    links: list[str], workers: int, headless: bool = False
 ) -> tuple[list[dict[str, str]], list[tuple[str, str]]]:
     if not links:
         return [], []
@@ -258,7 +292,9 @@ def scrape_details_parallel(
     rows: list[dict[str, str]] = []
     errors: list[tuple[str, str]] = []
     with ProcessPoolExecutor(max_workers=worker_count) as executor:
-        futures = [executor.submit(scrape_ad_chunk, chunk) for chunk in chunks]
+        futures = [
+            executor.submit(scrape_ad_chunk, chunk, headless) for chunk in chunks
+        ]
         for future in as_completed(futures):
             chunk_rows, chunk_errors = future.result()
             rows.extend(chunk_rows)
@@ -275,7 +311,7 @@ def main() -> None:
     csv_links = load_csv_links(args.csv_output)
     # Normalize/deduplicate an existing file before the first browser search.
     store_links(args.output, known_links, [])
-    driver = build_driver()
+    driver = build_driver(headless=args.headless)
     try:
         links = collect_links(
             driver,
@@ -291,7 +327,9 @@ def main() -> None:
         f"Scraping details for {len(detail_links)} ads with "
         f"up to {args.detail_workers} worker processes."
     )
-    rows, errors = scrape_details_parallel(detail_links, args.detail_workers)
+    rows, errors = scrape_details_parallel(
+        detail_links, args.detail_workers, args.headless
+    )
     for number, row in enumerate(rows, start=1):
         append_csv_row(args.csv_output, row)
         csv_links.add(row["link"])

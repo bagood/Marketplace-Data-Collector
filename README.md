@@ -123,12 +123,13 @@ python scrapperScripts/olx_scraper.py --min-load-more-clicks 10
 
 ## Data analysis
 
-`analyzeData/analyze_data.py` concatenates every CSV in `data/`, adds a `source`
-column containing the source filename, and rates each phone from its description
-using the rules in `analyzeData/condition_guidelines.md`. It invokes Codex CLI
-through Python subprocesses in batches and writes a pipe-delimited result to
-`data/combined_rated_ads.csv`. The combined output is excluded from subsequent
-input scans so it cannot be concatenated into itself.
+`analyzeData/analyze_data.py` scans every source CSV in `data/`, adds a `source`
+column containing the source filename, and rates each new phone from its
+description using the rules in `analyzeData/condition_guidelines.md`. An ad is
+considered already processed when its `link` is present in
+`data/combined_rated_ads.csv`. Existing ads are not rated again; newly rated ads
+are appended to the pipe-delimited combined output after each successful batch.
+The combined output is excluded from input scans.
 
 The combined output columns are:
 
@@ -145,4 +146,83 @@ model and batch size can be overridden:
 
 ```bash
 python analyzeData/analyze_data.py --model gpt-5.6-luna --batch-size 10
+```
+
+## MCP and FastAPI server
+
+The read-only server exposes `data/combined_rated_ads.csv` through both a REST
+API and MCP Streamable HTTP. Its implementation is separated into controller,
+service, and repository layers under `mcp_server/`.
+
+```bash
+pip install -r requirements.txt
+uvicorn mcp_server.main:app --host 127.0.0.1 --port 8000 --reload
+```
+
+Connect an MCP client to `http://127.0.0.1:8000/mcp`. The MCP tools are
+`fetch_ads`, `get_ad_by_link`, and `get_dataset_metadata`. Matching REST routes
+start at `/api/v1/ads`, and interactive API documentation is at `/docs`.
+
+`fetch_ads` supports `limit`, `offset`, `source`, `condition_rating`, and a
+case-insensitive `query` filter. Page size is capped at 500 rows. To select a
+different file, set `COMBINED_ADS_CSV` to its absolute path.
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+## Docker Compose
+
+The Compose stack uses Python 3.10 and starts the MCP server alongside the
+`collect_analyze_data.py` pipeline. The pipeline launches both scrapers concurrently,
+waits for them to finish successfully, and then runs incremental analysis.
+Chromium, ChromeDriver, and Codex CLI are installed in the image.
+The container explicitly uses `/usr/bin/chromium` and
+`/usr/bin/chromedriver`, avoiding Selenium Manager architecture detection on
+ARM64 Docker hosts.
+
+```bash
+cp .env.example .env
+docker compose run --rm codex-login
+# Open the displayed URL and enter its one-time code using your ChatGPT account.
+docker compose up --build
+```
+
+If device login is unavailable, enable device-code authorization in your
+ChatGPT account's **Settings → Security** and run the login command again.
+
+The MCP endpoint is available at `http://localhost:8000/mcp`. Scraped CSV and
+link files persist in the host's `data/` and `links/` directories. The
+collection container exits after completing one scrape-and-analysis run while
+the MCP service remains active. Codex authentication is stored in the private
+`codex-auth` Docker volume. Run the full pipeline again without restarting MCP
+with:
+
+```bash
+docker compose run --rm collect-data
+```
+
+The host port and detail worker counts can be configured through environment
+variables:
+
+```bash
+OPENAI_API_KEY=... MCP_PORT=8080 FACEBOOK_DETAIL_WORKERS=1 OLX_DETAIL_WORKERS=1 docker compose up --build
+```
+
+To check the cached ChatGPT login:
+
+```bash
+docker compose run --rm codex-login codex login status
+```
+
+Do not put a ChatGPT password, browser cookie, or access token in `.env`.
+`docker compose down` preserves the login volume; `docker compose down -v`
+deletes it and requires signing in again. API-platform authentication remains
+available by setting `OPENAI_API_KEY` in `.env`, but API usage is billed
+separately from the ChatGPT subscription.
+
+The same pipeline can be run locally:
+
+```bash
+python collect_analyze_data.py --headless
 ```

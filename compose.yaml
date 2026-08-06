@@ -1,0 +1,61 @@
+services:
+  mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["uvicorn", "mcp_server.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "${MCP_PORT:-8000}:8000"
+    environment:
+      COMBINED_ADS_CSV: /app/data/combined_rated_ads.csv
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    init: true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health').read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  collect-analyze-data:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command:
+      - python
+      - collect_analyze_data.py
+      - --headless
+      - --facebook-workers
+      - "${FACEBOOK_DETAIL_WORKERS:-2}"
+      - --olx-workers
+      - "${OLX_DETAIL_WORKERS:-2}"
+      - --model
+      - "${CODEX_MODEL:-gpt-5.5}"
+      - --batch-size
+      - "${ANALYSIS_BATCH_SIZE:-20}"
+    environment:
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+    volumes:
+      - ./data:/app/data
+      - ./links:/app/links
+      - codex-auth:/root/.codex
+    shm_size: 2gb
+    init: true
+    restart: "no"
+
+  codex-login:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["codex", "login", "--device-auth"]
+    environment:
+      CODEX_HOME: /root/.codex
+    volumes:
+      - codex-auth:/root/.codex
+    stdin_open: true
+    tty: true
+    profiles: ["tools"]
+
+volumes:
+  codex-auth:

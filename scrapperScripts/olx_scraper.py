@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
@@ -18,6 +19,7 @@ from selenium.common.exceptions import (
     TimeoutException,
 )
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
@@ -41,19 +43,46 @@ DETAIL_SELECTORS = {
 }
 CSV_FIELDS = ("link", "title", "price", "description", "timestamp")
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
 
 
 def build_driver(headless: bool, profile_dir: Path | None) -> webdriver.Chrome:
     options = Options()
+    chrome_binary = os.getenv("CHROME_BINARY")
+    chromedriver_path = os.getenv("CHROMEDRIVER_PATH")
+    if chrome_binary:
+        options.binary_location = chrome_binary
     if headless:
         options.add_argument("--headless=new")
     if profile_dir:
         profile_dir.mkdir(parents=True, exist_ok=True)
         options.add_argument(f"--user-data-dir={profile_dir.resolve()}")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-notifications")
     options.add_argument("--start-maximized")
     options.add_argument("--lang=id-ID")
-    return webdriver.Chrome(options=options)
+    options.add_argument(f"user-agent={DEFAULT_USER_AGENT}")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
+    service = Service(executable_path=chromedriver_path) if chromedriver_path else None
+    driver = webdriver.Chrome(service=service, options=options)
+    driver.execute_cdp_cmd(
+        "Page.addScriptToEvaluateOnNewDocument",
+        {
+            "source": """
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined
+                })
+            """
+        },
+    )
+    return driver
 
 
 def canonical_item_url(value: str) -> str | None:
