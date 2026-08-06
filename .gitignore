@@ -5,3 +5,6 @@ __pycache__/
 *.pyc
 links/*.txt
 data/*.csv
+analyzeData/*.tmp
+
+.DS_Store

@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "ratings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "row_id": { "type": "integer" },
+          "condition_rating": {
+            "type": "string",
+            "enum": ["Excellent", "Good", "Fair", "Poor", "Unknown"]
+          },
+          "condition_reason": { "type": "string" }
+        },
+        "required": ["row_id", "condition_rating", "condition_reason"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["ratings"],
+  "additionalProperties": false
+}

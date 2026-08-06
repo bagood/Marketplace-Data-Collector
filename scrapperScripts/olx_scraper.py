@@ -7,6 +7,7 @@ import argparse
 import csv
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
@@ -38,7 +39,7 @@ DETAIL_SELECTORS = {
         '[data-testid="ad-description"]',
     ),
 }
-CSV_FIELDS = ("link", "title", "price", "description")
+CSV_FIELDS = ("link", "title", "price", "description", "timestamp")
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -179,6 +180,7 @@ def scrape_ad_details(driver: webdriver.Chrome, link: str) -> dict[str, str]:
         "title": first_element_text(driver, DETAIL_SELECTORS["title"]),
         "price": first_element_text(driver, DETAIL_SELECTORS["price"]),
         "description": first_element_text(driver, DETAIL_SELECTORS["description"]),
+        "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
     }
 
 
@@ -198,6 +200,7 @@ def load_csv_links(csv_output: Path) -> set[str]:
                     "title": row.get("title", ""),
                     "price": row.get("price", ""),
                     "description": row.get("description", ""),
+                    "timestamp": row.get("timestamp", ""),
                 }
 
     # Normalize older comma-delimited files and remove any duplicate rows.
@@ -282,7 +285,7 @@ def parse_args() -> argparse.Namespace:
         "--load-more-clicks",
         dest="min_load_more_clicks",
         type=int,
-        default=5,
+        default=2,
         help="Exact number of successful Muat Lainnya clicks per refresh",
     )
     parser.add_argument(
@@ -294,7 +297,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-load-more",
         type=int,
-        default=10,
+        default=5,
         help="Maximum Muat Lainnya attempts per refresh",
     )
     parser.add_argument("--headless", action="store_true")

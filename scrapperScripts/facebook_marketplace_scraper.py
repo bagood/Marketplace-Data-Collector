@@ -8,6 +8,7 @@ import csv
 import re
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
@@ -24,7 +25,7 @@ CLASS_SELECTOR = ".x1mfogq2.xsfy40s.x1cnzs8.xshsftc.x1cbb1x2"
 ITEM_LINK_SELECTOR = 'a[href*="/marketplace/item/"]'
 ITEM_PATH_PATTERN = re.compile(r"^/marketplace/item/([^/?#]+)")
 PRICE_PATTERN = re.compile(r"^(?:Rp|IDR)\s*[\d.,]+", re.IGNORECASE)
-CSV_FIELDS = ("link", "title", "price", "description")
+CSV_FIELDS = ("link", "title", "price", "description", "timestamp")
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -191,6 +192,7 @@ def scrape_ad_details(driver: webdriver.Chrome, link: str) -> dict[str, str]:
         or meta_content(driver, "og:title"),
         "price": extract_price(driver),
         "description": extract_description(driver),
+        "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
     }
 
 
@@ -210,6 +212,7 @@ def load_csv_links(csv_output: Path) -> set[str]:
                     "title": row.get("title", ""),
                     "price": row.get("price", ""),
                     "description": row.get("description", ""),
+                    "timestamp": row.get("timestamp", ""),
                 }
 
     with csv_output.open("w", encoding="utf-8", newline="") as file:
