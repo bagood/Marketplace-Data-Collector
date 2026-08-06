@@ -1,0 +1,7 @@
+.venv/
+.chrome-profile/
+.olx-chrome-profile/
+__pycache__/
+*.pyc
+links/*.txt
+data/*.csv
