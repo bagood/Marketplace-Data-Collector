@@ -17,6 +17,7 @@ scrapperScripts/  Marketplace scraping programs
 links/            Deduplicated advertisement URLs
 data/             Marketplace CSV data and combined analysis output
 analyzeData/      Data concatenation, rating logic, schema, and guidelines
+uploadToGoogleSheets/  Standalone Google Sheets upload service and Docker image
 ```
 
 Use these tools responsibly and in accordance with each marketplace's terms,
@@ -125,7 +126,11 @@ python scrapperScripts/olx_scraper.py --min-load-more-clicks 10
 
 `analyzeData/analyze_data.py` scans every source CSV in `data/`, adds a `source`
 column containing the source filename, and rates each new phone from its
-description using the rules in `analyzeData/condition_guidelines.md`. An ad is
+description using the rules in `analyzeData/condition_guidelines.md`. It also
+extracts a canonical `phone_type` from each ad title (for example, `iPhone 12`
+or `iPhone 12 Pro Max`). Every assigned label is recorded in
+`analyzeData/phone_type_labels.json`; matching is case-insensitive, so title
+variants such as `IPhone 11` reuse the documented `iPhone 11` label. An ad is
 considered already processed when its `link` is present in
 `data/combined_rated_ads.csv`. Existing ads are not rated again; newly rated ads
 are appended to the pipe-delimited combined output after each successful batch.
@@ -134,12 +139,66 @@ The combined output is excluded from input scans.
 The combined output columns are:
 
 ```text
-link|title|price|description|timestamp|source|condition_rating|condition_reason
+link|title|price|description|timestamp|source|phone_type|condition_rating|condition_reason
 ```
 
 ```bash
 python analyzeData/analyze_data.py
 ```
+
+On the next run, combined rows created by an older version are backfilled with
+phone types from their titles without invoking Codex or changing their existing
+condition ratings. Titles without a recognizable iPhone model receive the
+documented `Unknown` label.
+
+### Google Sheets upload
+
+The analyzer can replace a Google Sheets worksheet with the complete combined
+CSV after analysis. Enable the Google Sheets API, create a service account, and
+share the destination spreadsheet with that service account as an editor.
+
+Encode the downloaded service-account JSON as a single Base64 line. This avoids
+multiline private-key parsing problems in `.env`:
+
+```bash
+python -c 'import base64, pathlib; print(base64.b64encode(pathlib.Path("/absolute/path/to/service-account.json").read_bytes()).decode())'
+```
+
+Copy the output into `.env` together with the destination settings:
+
+```dotenv
+GOOGLE_SHEETS_SPREADSHEET_ID=your_spreadsheet_id
+GOOGLE_SHEETS_WORKSHEET=Ads
+GOOGLE_SERVICE_ACCOUNT_JSON_BASE64=paste_the_generated_base64_value_here
+```
+
+The spreadsheet ID is the value between `/d/` and `/edit` in its URL. The
+worksheet is created when it does not exist. Existing worksheet values are
+cleared before the complete CSV is uploaded using raw values, while cell
+formatting is preserved. If `GOOGLE_SHEETS_SPREADSHEET_ID` is unset, analysis
+continues without an upload.
+
+The uploader is a standalone package under `uploadToGoogleSheets/`. It uses the
+repository's root `Dockerfile` and shared dependencies. To upload the current
+combined CSV without scraping or analysis:
+
+```bash
+python -m uploadToGoogleSheets.upload_to_google_sheets \
+  --spreadsheet-id your_spreadsheet_id \
+  --worksheet "Ads"
+```
+
+The dedicated Compose service shares the CSV read-only and automatically reads
+all Google configuration and credentials from `.env`:
+
+```bash
+docker compose run --rm upload-to-google-sheets
+```
+
+`GOOGLE_SERVICE_ACCOUNT_JSON_BASE64` is decoded only in memory. File-based
+Application Default Credentials remain supported as a fallback when this value
+is empty. Although `.env` is ignored by Git, it contains a private key and must
+not be copied, logged, or committed.
 
 The default `gpt-5.6-luna` model is the lightweight classification model. The
 model and batch size can be overridden:

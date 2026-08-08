@@ -36,6 +36,9 @@ services:
       - "${ANALYSIS_BATCH_SIZE:-20}"
     environment:
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      GOOGLE_SHEETS_SPREADSHEET_ID: "${GOOGLE_SHEETS_SPREADSHEET_ID:-}"
+      GOOGLE_SHEETS_WORKSHEET: "${GOOGLE_SHEETS_WORKSHEET:-Ads}"
+      GOOGLE_SERVICE_ACCOUNT_JSON_BASE64: "${GOOGLE_SERVICE_ACCOUNT_JSON_BASE64:-}"
     volumes:
       - ./data:/app/data
       - ./links:/app/links
@@ -43,6 +46,26 @@ services:
     shm_size: 2gb
     init: true
     restart: "no"
+
+  upload-to-google-sheets:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command:
+      - python
+      - -m
+      - uploadToGoogleSheets.upload_to_google_sheets
+      - --csv
+      - /app/data/combined_rated_ads.csv
+    environment:
+      GOOGLE_SHEETS_SPREADSHEET_ID: "${GOOGLE_SHEETS_SPREADSHEET_ID:-}"
+      GOOGLE_SHEETS_WORKSHEET: "${GOOGLE_SHEETS_WORKSHEET:-Ads}"
+      GOOGLE_SERVICE_ACCOUNT_JSON_BASE64: "${GOOGLE_SERVICE_ACCOUNT_JSON_BASE64:-}"
+    volumes:
+      - ./data:/app/data:ro
+    init: true
+    restart: "no"
+    profiles: ["tools"]
 
   codex-login:
     build:

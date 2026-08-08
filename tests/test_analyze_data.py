@@ -6,8 +6,12 @@ from unittest.mock import patch
 
 from analyzeData.analyze_data import (
     OUTPUT_FIELDS,
+    PhoneTypeLabels,
     ad_identity,
     append_output,
+    assign_phone_types,
+    backfill_output_phone_types,
+    extract_phone_type,
     load_existing_identities,
     normalize_output_schema,
     select_new_rows,
@@ -32,6 +36,7 @@ class AnalyzeDataIncrementalTest(unittest.TestCase):
             "description": description,
             "timestamp": "2026-01-01T00:00:00+07:00",
             "source": "olx_ads.csv",
+            "phone_type": "iPhone 11",
             "condition_rating": "Good",
             "condition_reason": "Clean condition",
         }
@@ -85,6 +90,49 @@ class AnalyzeDataIncrementalTest(unittest.TestCase):
         self.assertEqual(rows[0]["timestamp"], "")
         self.assertEqual(rows[1]["timestamp"], "2026-01-01T00:00:00+07:00")
 
+    def test_phone_type_is_extracted_from_title_with_canonical_casing(self) -> None:
+        cases = {
+            "IPhone 11 64 GB": "iPhone 11",
+            "IPHONE 12 promax 256GB": "iPhone 12 Pro Max",
+            "Apple iPhone 13 MINI": "iPhone 13 mini",
+            "ip 14+ ex iBox": "iPhone 14 Plus",
+            "Unrelated phone listing": "Unknown",
+        }
+        for title, expected in cases.items():
+            with self.subTest(title=title):
+                self.assertEqual(extract_phone_type(title), expected)
+
+    def test_phone_labels_are_documented_and_reused_case_insensitively(self) -> None:
+        labels_path = Path(self.temp_dir.name) / "phone_type_labels.json"
+        labels = PhoneTypeLabels(labels_path)
+        self.assertEqual(labels.register("iPhone 11"), "iPhone 11")
+        self.assertEqual(labels.register("IPhone 11"), "iPhone 11")
+        rows = [self.row("https://example/1")]
+        rows[0]["title"] = "IPHONE 12 PRO"
+        assign_phone_types(rows, labels)
+        labels.save()
+
+        reloaded = PhoneTypeLabels(labels_path)
+        self.assertEqual(reloaded.labels, ["iPhone 11", "iPhone 12 Pro"])
+        self.assertEqual(rows[0]["phone_type"], "iPhone 12 Pro")
+
+    def test_existing_output_phone_types_are_backfilled_without_rerating(self) -> None:
+        legacy_fields = tuple(field for field in OUTPUT_FIELDS if field != "phone_type")
+        row = self.row("https://example/1")
+        row["title"] = "IPhone 13 128GB"
+        with self.output.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=legacy_fields, delimiter="|")
+            writer.writeheader()
+            writer.writerow({key: value for key, value in row.items() if key in legacy_fields})
+
+        labels = PhoneTypeLabels(Path(self.temp_dir.name) / "labels.json")
+        self.assertEqual(backfill_output_phone_types(self.output, labels), 1)
+
+        with self.output.open(encoding="utf-8", newline="") as handle:
+            output_row = next(csv.DictReader(handle, delimiter="|"))
+        self.assertEqual(output_row["phone_type"], "iPhone 13")
+        self.assertEqual(output_row["condition_rating"], "Good")
+
     def test_main_rates_new_ad_once_then_skips_it(self) -> None:
         from analyzeData.analyze_data import main
 
@@ -100,8 +148,9 @@ class AnalyzeDataIncrementalTest(unittest.TestCase):
         output = data_dir / "combined_rated_ads.csv"
         guidelines = Path(self.temp_dir.name) / "guidelines.md"
         guidelines.write_text("guidelines", encoding="utf-8")
+        phone_labels = Path(self.temp_dir.name) / "phone_type_labels.json"
         argv = ["analyze_data.py", "--data-dir", str(data_dir), "--output", str(output),
-                "--guidelines", str(guidelines)]
+                "--guidelines", str(guidelines), "--phone-labels", str(phone_labels)]
 
         with patch("sys.argv", argv), patch(
             "analyzeData.analyze_data.rate_batch_with_codex",
@@ -115,6 +164,55 @@ class AnalyzeDataIncrementalTest(unittest.TestCase):
             rows = list(csv.DictReader(handle, delimiter="|"))
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["link"], "https://example/1")
+        self.assertEqual(rows[0]["phone_type"], "Unknown")
+
+    def test_main_uploads_completed_output_when_google_sheet_is_configured(self) -> None:
+        from analyzeData.analyze_data import main
+
+        data_dir = Path(self.temp_dir.name) / "data"
+        data_dir.mkdir()
+        output = data_dir / "combined_rated_ads.csv"
+        existing_row = self.row("https://example/1")
+        append_output(output, [existing_row])
+        source_fields = ("link", "title", "price", "description", "timestamp")
+        with (data_dir / "olx_ads.csv").open(
+            "w", encoding="utf-8", newline=""
+        ) as handle:
+            writer = csv.DictWriter(handle, fieldnames=source_fields, delimiter="|")
+            writer.writeheader()
+            writer.writerow(
+                {key: value for key, value in existing_row.items() if key in source_fields}
+            )
+        guidelines = Path(self.temp_dir.name) / "guidelines.md"
+        guidelines.write_text("guidelines", encoding="utf-8")
+        labels = Path(self.temp_dir.name) / "labels.json"
+        argv = [
+            "analyze_data.py",
+            "--data-dir",
+            str(data_dir),
+            "--output",
+            str(output),
+            "--guidelines",
+            str(guidelines),
+            "--phone-labels",
+            str(labels),
+            "--google-spreadsheet-id",
+            "spreadsheet-123",
+            "--google-worksheet",
+            "Phone Ads",
+        ]
+
+        with patch("sys.argv", argv), patch(
+            "analyzeData.analyze_data.upload_csv_to_google_sheets",
+            return_value={"rows": 1, "cells": 9},
+        ) as upload:
+            main()
+
+        upload.assert_called_once_with(
+            output,
+            "spreadsheet-123",
+            "Phone Ads",
+        )
 
     def test_docker_auth_preflight_rejects_missing_credentials(self) -> None:
         with tempfile.TemporaryDirectory() as codex_home, patch.dict(

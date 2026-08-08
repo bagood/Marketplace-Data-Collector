@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Rate new scraper ads with Codex CLI and append them to the combined CSV."""
+"""Extract phone types, rate new scraper ads, and update the combined CSV."""
 
 from __future__ import annotations
 
@@ -7,21 +7,132 @@ import argparse
 import csv
 import json
 import os
+import re
 import subprocess
+import sys
 import tempfile
+import unicodedata
 from pathlib import Path
 
 
 ANALYZER_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = ANALYZER_DIR.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from uploadToGoogleSheets.upload_to_google_sheets import upload_csv_to_google_sheets
+
 DEFAULT_DATA_DIR = PROJECT_ROOT / "data"
 DEFAULT_OUTPUT = DEFAULT_DATA_DIR / "combined_rated_ads.csv"
 DEFAULT_GUIDELINES = ANALYZER_DIR / "condition_guidelines.md"
+DEFAULT_PHONE_LABELS = ANALYZER_DIR / "phone_type_labels.json"
 OUTPUT_SCHEMA = ANALYZER_DIR / "rating_schema.json"
 BASE_FIELDS = ("link", "title", "price", "description", "timestamp", "source")
+PHONE_TYPE_FIELD = "phone_type"
 RATING_FIELDS = ("condition_rating", "condition_reason")
-OUTPUT_FIELDS = BASE_FIELDS + RATING_FIELDS
+OUTPUT_FIELDS = BASE_FIELDS + (PHONE_TYPE_FIELD,) + RATING_FIELDS
 VALID_RATINGS = {"Excellent", "Good", "Fair", "Poor", "Unknown"}
+UNKNOWN_PHONE_TYPE = "Unknown"
+
+IPHONE_TITLE_PATTERN = re.compile(
+    r"""
+    \b(?:apple\s+)?(?:i[\s-]*phone|ip)\s*[-:]?\s*
+    (?P<model>\d{1,2}[sc]?|xs|xr|x|se)
+    (?:\s*[-]?\s*(?P<variant>pro[\s-]*max|pro|max|plus|mini|\+))?
+    (?![a-z0-9])
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _label_key(label: str) -> str:
+    """Return a comparison key that ignores casing and separator differences."""
+    normalized = unicodedata.normalize("NFKC", label).strip()
+    return re.sub(r"[\s_-]+", " ", normalized).casefold()
+
+
+class PhoneTypeLabels:
+    """Persist and reuse the canonical phone-type labels assigned to ads."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.labels: list[str] = []
+        self._labels_by_key: dict[str, str] = {}
+        if path.exists():
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            documented_labels = payload.get("labels") if isinstance(payload, dict) else None
+            if not isinstance(documented_labels, list) or not all(
+                isinstance(label, str) and label.strip() for label in documented_labels
+            ):
+                raise RuntimeError(
+                    f"{path} must contain a string array named 'labels'"
+                )
+            for label in documented_labels:
+                self.register(label)
+
+    def register(self, proposed_label: str) -> str:
+        """Return an existing canonical label or document a new one in memory."""
+        label = proposed_label.strip() or UNKNOWN_PHONE_TYPE
+        key = _label_key(label)
+        if key in self._labels_by_key:
+            return self._labels_by_key[key]
+        self.labels.append(label)
+        self._labels_by_key[key] = label
+        return label
+
+    def save(self) -> None:
+        """Atomically write the complete canonical-label registry."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_suffix(self.path.suffix + ".tmp")
+        payload = {
+            "description": (
+                "Canonical phone_type labels assigned by analyze_data.py. "
+                "Labels are matched case-insensitively and reused."
+            ),
+            "labels": self.labels,
+        }
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(self.path)
+
+
+def extract_phone_type(title: str) -> str:
+    """Extract a consistently formatted iPhone model from an advertisement title."""
+    normalized_title = unicodedata.normalize("NFKC", title)
+    match = IPHONE_TITLE_PATTERN.search(normalized_title)
+    if not match:
+        return UNKNOWN_PHONE_TYPE
+
+    raw_model = match.group("model").casefold()
+    if raw_model.isdigit():
+        model = str(int(raw_model))
+    elif raw_model[:-1].isdigit() and raw_model.endswith(("s", "c")):
+        model = f"{int(raw_model[:-1])}{raw_model[-1]}"
+    else:
+        model = raw_model.upper()
+
+    raw_variant = (match.group("variant") or "").casefold()
+    compact_variant = re.sub(r"[\s-]+", "", raw_variant)
+    variants = {
+        "promax": "Pro Max",
+        "pro": "Pro",
+        "max": "Max",
+        "plus": "Plus",
+        "+": "Plus",
+        "mini": "mini",
+    }
+    variant = variants.get(compact_variant, "")
+    return " ".join(part for part in ("iPhone", model, variant) if part)
+
+
+def assign_phone_types(
+    rows: list[dict[str, str]], labels: PhoneTypeLabels
+) -> None:
+    """Assign a documented canonical phone type to each supplied row."""
+    for row in rows:
+        row[PHONE_TYPE_FIELD] = labels.register(extract_phone_type(row.get("title", "")))
 
 
 def validate_codex_auth() -> None:
@@ -218,11 +329,53 @@ def normalize_output_schema(output: Path) -> None:
     temporary.replace(output)
 
 
+def backfill_output_phone_types(output: Path, labels: PhoneTypeLabels) -> int:
+    """Extract missing phone types in existing output rows without rating them again."""
+    if not output.exists() or output.stat().st_size == 0:
+        return 0
+    normalize_output_schema(output)
+    with output.open("r", encoding="utf-8-sig", newline="") as file:
+        reader = csv.DictReader(file, delimiter="|")
+        rows = list(reader)
+
+    updated = 0
+    for row in rows:
+        current_label = row.get(PHONE_TYPE_FIELD, "").strip()
+        if current_label:
+            canonical_label = labels.register(current_label)
+        else:
+            canonical_label = labels.register(extract_phone_type(row.get("title", "")))
+        if current_label != canonical_label:
+            updated += 1
+        row[PHONE_TYPE_FIELD] = canonical_label
+
+    if not updated:
+        return 0
+    temporary = output.with_suffix(output.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=OUTPUT_FIELDS, delimiter="|")
+        writer.writeheader()
+        writer.writerows(rows)
+    temporary.replace(output)
+    return updated
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--guidelines", type=Path, default=DEFAULT_GUIDELINES)
+    parser.add_argument("--phone-labels", type=Path, default=DEFAULT_PHONE_LABELS)
+    parser.add_argument(
+        "--google-spreadsheet-id",
+        default=os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID", ""),
+        help="Upload the completed CSV to this Google spreadsheet ID",
+    )
+    parser.add_argument(
+        "--google-worksheet",
+        default=os.getenv("GOOGLE_SHEETS_WORKSHEET", "Ads"),
+        help="Target worksheet title (default: Ads)",
+    )
     parser.add_argument("--model", default="gpt-5.5")
     parser.add_argument("--batch-size", type=int, default=20)
     parser.add_argument("--timeout", type=float, default=300.0)
@@ -236,6 +389,10 @@ def main() -> None:
     if not args.guidelines.exists():
         raise SystemExit(f"Guidelines file not found: {args.guidelines}")
 
+    phone_labels = PhoneTypeLabels(args.phone_labels)
+    backfilled = backfill_output_phone_types(args.output, phone_labels)
+    phone_labels.save()
+
     source_rows = read_source_rows(args.data_dir, excluded_path=args.output)
     existing = load_existing_identities(args.output)
     new_rows = select_new_rows(source_rows, existing)
@@ -245,10 +402,14 @@ def main() -> None:
         f"Loaded {len(source_rows)} source rows and {len(existing)} existing rated ads; "
         f"{len(new_rows)} new ads require Codex rating."
     )
+    if backfilled:
+        print(f"Backfilled phone types for {backfilled} existing ads.")
     if new_rows:
         validate_codex_auth()
     for start in range(0, len(new_rows), args.batch_size):
         batch_rows = new_rows[start : start + args.batch_size]
+        assign_phone_types(batch_rows, phone_labels)
+        phone_labels.save()
         batch = [
             {"row_id": row_id, "description": row["description"]}
             for row_id, row in enumerate(batch_rows)
@@ -264,6 +425,17 @@ def main() -> None:
         print("No new ads to rate or append.")
     else:
         print(f"Appended {len(new_rows)} newly rated ads to {args.output}")
+
+    if args.google_spreadsheet_id.strip():
+        upload_result = upload_csv_to_google_sheets(
+            args.output,
+            args.google_spreadsheet_id,
+            args.google_worksheet,
+        )
+        print(
+            f"Uploaded {upload_result['rows']} data rows to Google Sheets "
+            f"worksheet {args.google_worksheet!r}."
+        )
 
 
 if __name__ == "__main__":
