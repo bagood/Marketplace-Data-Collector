@@ -14,6 +14,7 @@ from analyzeData.analyze_data import (
     extract_phone_type,
     load_existing_identities,
     normalize_output_schema,
+    refresh_missing_output_prices,
     select_new_rows,
     validate_codex_auth,
 )
@@ -132,6 +133,22 @@ class AnalyzeDataIncrementalTest(unittest.TestCase):
             output_row = next(csv.DictReader(handle, delimiter="|"))
         self.assertEqual(output_row["phone_type"], "iPhone 13")
         self.assertEqual(output_row["condition_rating"], "Good")
+
+    def test_recovered_source_price_refreshes_existing_combined_row(self) -> None:
+        combined_row = self.row("https://example/1")
+        combined_row["price"] = ""
+        append_output(self.output, [combined_row])
+        source_row = self.row("https://example/1")
+        source_row["price"] = "Rp 5.000.000"
+
+        self.assertEqual(
+            refresh_missing_output_prices(self.output, [source_row]),
+            1,
+        )
+        with self.output.open(encoding="utf-8", newline="") as handle:
+            refreshed = next(csv.DictReader(handle, delimiter="|"))
+        self.assertEqual(refreshed["price"], "Rp 5.000.000")
+        self.assertEqual(refreshed["condition_rating"], "Good")
 
     def test_main_rates_new_ad_once_then_skips_it(self) -> None:
         from analyzeData.analyze_data import main

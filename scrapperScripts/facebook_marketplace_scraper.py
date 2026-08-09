@@ -1,71 +1,64 @@
 #!/usr/bin/env python3
-"""Collect Facebook Marketplace links with Selenium."""
+"""Collect Facebook Marketplace ad links with Selenium."""
 
 from __future__ import annotations
 
 import argparse
-import csv
-import os
 import re
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
+from functools import partial
 from pathlib import Path
+from typing import Mapping
 from urllib.parse import urljoin, urlparse
 
 from selenium import webdriver
 from selenium.common.exceptions import TimeoutException
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
+try:
+    from . import helper
+except ImportError:
+    import helper
 
-DEFAULT_URL = "https://www.facebook.com/marketplace/jakarta/search?sortBy=creation_time_descend&query=iphone&exact=false"
-CLASS_SELECTOR = ".x1mfogq2.xsfy40s.x1cnzs8.xshsftc.x1cbb1x2"
+
+DEFAULT_URL = (
+    "https://www.facebook.com/marketplace/jakarta/search"
+    "?sortBy=creation_time_descend&query=iphone&exact=false"
+)
 ITEM_LINK_SELECTOR = 'a[href*="/marketplace/item/"]'
 ITEM_PATH_PATTERN = re.compile(r"^/marketplace/item/([^/?#]+)")
-PRICE_PATTERN = re.compile(r"^(?:Rp|IDR)\s*[\d.,]+", re.IGNORECASE)
-CSV_FIELDS = ("link", "title", "price", "description", "timestamp")
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/120.0.0.0 Safari/537.36"
+CLOSE_OVERLAY_XPATH = "//div[@aria-label='Close']"
+TITLE_CLASS = (
+    "x193iq5w xeuugli x13faqbe x1vvkbs xlh3980 xvmahel x1n0sxbx "
+    "x1lliihq x1s928wv xhkezso x1gmr53x x1cpjm7i x1fgarty x1943h6x "
+    "xtoi2st x41vudc xngnso2 x1qb5hxa x1xlr1w8 xzsf02u"
 )
+TITLE_XPATH = f"//span[@class='{TITLE_CLASS}']"
+DESCRIPTION_SELECTOR = 'span[dir="auto"] > span'
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DETAIL_DRIVER_FACTORY = partial(helper.build_driver, language="en-US")
 
 
-def build_driver(headless: bool = False) -> webdriver.Chrome:
-    options = Options()
-    chrome_binary = os.getenv("CHROME_BINARY")
-    chromedriver_path = os.getenv("CHROMEDRIVER_PATH")
-    if chrome_binary:
-        options.binary_location = chrome_binary
-    if headless:
-        options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-notifications")
-    options.add_argument("--start-maximized")
-    options.add_argument("--lang=en-US")
-    options.add_argument(f"user-agent={DEFAULT_USER_AGENT}")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    options.add_experimental_option("useAutomationExtension", False)
-    service = Service(executable_path=chromedriver_path) if chromedriver_path else None
-    driver = webdriver.Chrome(service=service, options=options)
-    driver.execute_cdp_cmd(
-        "Page.addScriptToEvaluateOnNewDocument",
-        {
-            "source": """
-                Object.defineProperty(navigator, 'webdriver', {
-                    get: () => undefined
-                })
-            """
-        },
-    )
-    return driver
+def normalize_csv_row(row: Mapping[str, str], canonical: str) -> dict[str, str]:
+    """Normalize a Facebook row and enforce its unavailable-price marker."""
+    return {
+        "link": canonical,
+        "title": row.get("title", ""),
+        "price": "NaN",
+        "description": row.get("description", ""),
+        "timestamp": row.get("timestamp", ""),
+    }
+
+def canonical_item_url(value: str) -> str | None:
+    """Return a canonical Marketplace item URL, or None for unrelated input."""
+    absolute = urljoin("https://www.facebook.com", value.strip())
+    match = ITEM_PATH_PATTERN.match(urlparse(absolute).path)
+    if not match:
+        return None
+    return f"https://www.facebook.com/marketplace/item/{match.group(1)}/"
 
 
 def collect_links(
@@ -74,26 +67,81 @@ def collect_links(
     pause: float,
 ) -> list[str]:
     driver.get(url)
-    wait = WebDriverWait(driver, 360)
     try:
-        wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        WebDriverWait(driver, 360).until(
+            EC.presence_of_element_located((By.TAG_NAME, "body"))
+        )
     except TimeoutException as exc:
         raise RuntimeError("Facebook did not finish loading.") from exc
 
-    # Let the initially visible, client-rendered listing cards settle. This
-    # scraper intentionally does not scroll or request additional results.
     time.sleep(pause)
-    links: set[str] = set()
-    for element in driver.find_elements(By.CSS_SELECTOR, ITEM_LINK_SELECTOR):
-        href = element.get_attribute("href")
-        if href:
-            absolute = urljoin("https://www.facebook.com", href)
-            match = ITEM_PATH_PATTERN.match(urlparse(absolute).path)
-            if match:
-                links.add(f"https://www.facebook.com/marketplace/item/{match.group(1)}/")
-
+    links = {
+        canonical
+        for element in driver.find_elements(By.CSS_SELECTOR, ITEM_LINK_SELECTOR)
+        if (href := element.get_attribute("href"))
+        and (canonical := canonical_item_url(href)) is not None
+    }
     print(f"Collected {len(links)} unique links from the initial results.")
     return sorted(links)
+
+
+def close_listing_overlay(driver: webdriver.Chrome, timeout: float = 10.0) -> bool:
+    """Close the Marketplace overlay exposed by the detail-page flow."""
+    try:
+        element = WebDriverWait(driver, timeout).until(
+            EC.element_to_be_clickable((By.XPATH, CLOSE_OVERLAY_XPATH))
+        )
+        element.click()
+        return True
+    except TimeoutException:
+        return False
+
+
+def extract_title(driver: webdriver.Chrome, timeout: float = 10.0) -> str:
+    element = WebDriverWait(driver, timeout).until(
+        EC.visibility_of_element_located((By.XPATH, TITLE_XPATH))
+    )
+    return (element.get_attribute("innerText") or "").strip()
+
+
+def extract_full_description(
+    driver: webdriver.Chrome, timeout: float = 15.0
+) -> str:
+    """Return the longest rendered description candidate used by Facebook."""
+    elements = WebDriverWait(driver, timeout).until(
+        EC.presence_of_all_elements_located(
+            (By.CSS_SELECTOR, DESCRIPTION_SELECTOR)
+        )
+    )
+    texts = [element.text.strip() for element in elements if element.text.strip()]
+    return max(texts, key=len) if texts else ""
+
+
+def scrape_ad_details(driver: webdriver.Chrome, link: str) -> dict[str, str]:
+    print(f"Opening ad: {link}")
+    driver.get(link)
+    WebDriverWait(driver, 30).until(
+        EC.presence_of_element_located((By.TAG_NAME, "body"))
+    )
+    close_listing_overlay(driver)
+    return {
+        "link": link,
+        "title": extract_title(driver),
+        "price": "NaN",
+        "description": extract_full_description(driver),
+        "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+    }
+
+
+def load_links_with_incomplete_details(csv_output: Path) -> set[str]:
+    return {
+        link
+        for link, row in helper.read_csv_rows(
+            csv_output, canonical_item_url, normalize_csv_row
+        ).items()
+        if not row.get("title", "").strip()
+        or not row.get("description", "").strip()
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -108,7 +156,7 @@ def parse_args() -> argparse.Namespace:
         "--csv-output",
         type=Path,
         default=PROJECT_ROOT / "data" / "facebook_marketplace_ads.csv",
-        help="Pipe-delimited CSV file for ad details",
+        help="Pipe-delimited CSV file for Facebook ad details",
     )
     parser.add_argument(
         "--pause",
@@ -126,213 +174,49 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def canonical_item_url(value: str) -> str | None:
-    """Return a canonical Marketplace item URL, or None for unrelated input."""
-    absolute = urljoin("https://www.facebook.com", value.strip())
-    match = ITEM_PATH_PATTERN.match(urlparse(absolute).path)
-    if not match:
-        return None
-    return f"https://www.facebook.com/marketplace/item/{match.group(1)}/"
-
-
-def load_existing_links(output: Path) -> set[str]:
-    if not output.exists():
-        return set()
-    return {
-        canonical
-        for line in output.read_text(encoding="utf-8").splitlines()
-        if (canonical := canonical_item_url(line)) is not None
-    }
-
-
-def store_links(output: Path, known: set[str], found: list[str]) -> int:
-    before = len(known)
-    known.update(found)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    # Rewriting the complete set also cleans up duplicates from older runs.
-    output.write_text("".join(f"{link}\n" for link in sorted(known)), encoding="utf-8")
-    return len(known) - before
-
-
-def first_text(driver: webdriver.Chrome, selectors: tuple[str, ...]) -> str:
-    for selector in selectors:
-        for element in driver.find_elements(By.CSS_SELECTOR, selector):
-            text = element.text.strip()
-            if text:
-                return text
-    return ""
-
-
-def meta_content(driver: webdriver.Chrome, property_name: str) -> str:
-    elements = driver.find_elements(
-        By.CSS_SELECTOR, f'meta[property="{property_name}"][content]'
-    )
-    return elements[0].get_attribute("content").strip() if elements else ""
-
-
-def extract_price(driver: webdriver.Chrome) -> str:
-    candidates: list[str] = []
-    for element in driver.find_elements(By.XPATH, "//*[self::span or self::div]"):
-        text = element.text.strip()
-        if text and "\n" not in text and PRICE_PATTERN.match(text):
-            candidates.append(text)
-    return min(candidates, key=len) if candidates else ""
-
-
-def extract_description(driver: webdriver.Chrome) -> str:
-    description = driver.execute_script(
-        r"""
-        const headings = new Set([
-          "description", "seller's description", "deskripsi", "deskripsi penjual"
-        ]);
-        const candidates = [];
-        for (const element of document.querySelectorAll('span, h2, h3, div')) {
-          const heading = (element.innerText || '').trim().toLowerCase();
-          if (!headings.has(heading)) continue;
-          let container = element.parentElement;
-          for (let level = 0; container && level < 4; level++, container = container.parentElement) {
-            const text = (container.innerText || '').trim();
-            if (text.length > heading.length && text.length < 5000) {
-              const lines = text.split('\n').map(x => x.trim()).filter(Boolean);
-              const value = lines.filter(x => x.toLowerCase() !== heading).join('\n');
-              if (value) candidates.push(value);
-            }
-          }
-        }
-        candidates.sort((a, b) => a.length - b.length);
-        return candidates[0] || '';
-        """
-    )
-    return description.strip() if description else meta_content(driver, "og:description")
-
-
-def scrape_ad_details(driver: webdriver.Chrome, link: str) -> dict[str, str]:
-    print(f"Opening ad: {link}")
-    driver.get(link)
-    WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-    try:
-        WebDriverWait(driver, 10).until(
-            lambda browser: first_text(browser, ("main h1", "h1"))
-            or meta_content(browser, "og:title")
-        )
-    except TimeoutException:
-        pass
-
-    return {
-        "link": link,
-        "title": first_text(driver, ("main h1", "h1"))
-        or meta_content(driver, "og:title"),
-        "price": extract_price(driver),
-        "description": extract_description(driver),
-        "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
-    }
-
-
-def load_csv_links(csv_output: Path) -> set[str]:
-    if not csv_output.exists() or csv_output.stat().st_size == 0:
-        return set()
-
-    first_line = csv_output.read_text(encoding="utf-8").splitlines()[0]
-    delimiter = "|" if "|" in first_line else ","
-    with csv_output.open("r", encoding="utf-8", newline="") as file:
-        rows_by_link: dict[str, dict[str, str]] = {}
-        for row in csv.DictReader(file, delimiter=delimiter):
-            canonical = canonical_item_url(row.get("link", ""))
-            if canonical:
-                rows_by_link[canonical] = {
-                    "link": canonical,
-                    "title": row.get("title", ""),
-                    "price": row.get("price", ""),
-                    "description": row.get("description", ""),
-                    "timestamp": row.get("timestamp", ""),
-                }
-
-    with csv_output.open("w", encoding="utf-8", newline="") as file:
-        writer = csv.DictWriter(file, fieldnames=CSV_FIELDS, delimiter="|")
-        writer.writeheader()
-        writer.writerows(rows_by_link.values())
-    return set(rows_by_link)
-
-
-def append_csv_row(csv_output: Path, row: dict[str, str]) -> None:
-    csv_output.parent.mkdir(parents=True, exist_ok=True)
-    needs_header = not csv_output.exists() or csv_output.stat().st_size == 0
-    with csv_output.open("a", encoding="utf-8", newline="") as file:
-        writer = csv.DictWriter(file, fieldnames=CSV_FIELDS, delimiter="|")
-        if needs_header:
-            writer.writeheader()
-        writer.writerow(row)
-
-
-def scrape_ad_chunk(
-    links: list[str], headless: bool = False
-) -> tuple[list[dict[str, str]], list[tuple[str, str]]]:
-    """Scrape one link chunk in a dedicated process and Chrome instance."""
-    rows: list[dict[str, str]] = []
-    errors: list[tuple[str, str]] = []
-    driver = build_driver(headless=headless)
-    try:
-        for link in links:
-            try:
-                rows.append(scrape_ad_details(driver, link))
-            except Exception as exc:
-                errors.append((link, str(exc)))
-    finally:
-        driver.quit()
-    return rows, errors
-
-
-def scrape_details_parallel(
-    links: list[str], workers: int, headless: bool = False
-) -> tuple[list[dict[str, str]], list[tuple[str, str]]]:
-    if not links:
-        return [], []
-    worker_count = min(workers, len(links))
-    chunks = [links[index::worker_count] for index in range(worker_count)]
-    rows: list[dict[str, str]] = []
-    errors: list[tuple[str, str]] = []
-    with ProcessPoolExecutor(max_workers=worker_count) as executor:
-        futures = [
-            executor.submit(scrape_ad_chunk, chunk, headless) for chunk in chunks
-        ]
-        for future in as_completed(futures):
-            chunk_rows, chunk_errors = future.result()
-            rows.extend(chunk_rows)
-            errors.extend(chunk_errors)
-    return rows, errors
-
-
 def main() -> None:
     args = parse_args()
     if args.pause < 0 or args.detail_workers < 1:
         raise SystemExit("pause must be >= 0 and detail workers must be >= 1")
 
-    known_links = load_existing_links(args.output)
-    csv_links = load_csv_links(args.csv_output)
-    # Normalize/deduplicate an existing file before the first browser search.
-    store_links(args.output, known_links, [])
-    driver = build_driver(headless=args.headless)
+    known_links = helper.load_existing_links(args.output, canonical_item_url)
+
+    csv_links = helper.load_csv_links(
+        args.csv_output, canonical_item_url, normalize_csv_row
+    )
+
+    incomplete_links = load_links_with_incomplete_details(args.csv_output)
+
+    helper.store_links(args.output, known_links, [])
+
+    driver = helper.build_driver(headless=args.headless, language="en-US")
+
     try:
-        links = collect_links(
-            driver,
-            args.url,
-            args.pause,
-        )
-        new_count = store_links(args.output, known_links, links)
+        links = collect_links(driver, args.url, args.pause)
+        new_count = helper.store_links(args.output, known_links, links)
+
     finally:
         driver.quit()
 
-    detail_links = sorted(set(links) - csv_links)
+    detail_links = sorted((set(links) - csv_links) | incomplete_links)
     print(
         f"Scraping details for {len(detail_links)} ads with "
         f"up to {args.detail_workers} worker processes."
     )
-    rows, errors = scrape_details_parallel(
-        detail_links, args.detail_workers, args.headless
+    rows, errors = helper.scrape_details_parallel(
+        detail_links,
+        args.detail_workers,
+        args.headless,
+        DETAIL_DRIVER_FACTORY,
+        scrape_ad_details,
     )
     for number, row in enumerate(rows, start=1):
-        append_csv_row(args.csv_output, row)
-        csv_links.add(row["link"])
+        helper.upsert_csv_row(
+            args.csv_output,
+            row,
+            canonical_item_url,
+            normalize_csv_row,
+        )
         print(
             f"Saved ad details {number}/{len(rows)}: "
             f"{row['title'] or '[title unavailable]'}"
@@ -342,8 +226,8 @@ def main() -> None:
 
     print(
         f"Saved {new_count} new links. "
-        f"{len(known_links)} unique links are stored in {args.output}. "
-        f"Ad details are stored in {args.csv_output}."
+        f"{len(known_links)} unique Facebook Marketplace links are stored in "
+        f"{args.output}. Ad details are stored in {args.csv_output}."
     )
 
 

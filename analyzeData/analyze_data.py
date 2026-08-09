@@ -360,6 +360,42 @@ def backfill_output_phone_types(output: Path, labels: PhoneTypeLabels) -> int:
     return updated
 
 
+def refresh_missing_output_prices(
+    output: Path, source_rows: list[dict[str, str]]
+) -> int:
+    """Copy newly recovered source prices into existing combined rows."""
+    if not output.exists() or output.stat().st_size == 0:
+        return 0
+    prices_by_link = {
+        ad_identity(row): row.get("price", "").strip()
+        for row in source_rows
+        if ad_identity(row) and row.get("price", "").strip()
+    }
+    if not prices_by_link:
+        return 0
+
+    normalize_output_schema(output)
+    with output.open("r", encoding="utf-8-sig", newline="") as file:
+        rows = list(csv.DictReader(file, delimiter="|"))
+
+    updated = 0
+    for row in rows:
+        recovered_price = prices_by_link.get(ad_identity(row), "")
+        if not row.get("price", "").strip() and recovered_price:
+            row["price"] = recovered_price
+            updated += 1
+    if not updated:
+        return 0
+
+    temporary = output.with_suffix(output.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=OUTPUT_FIELDS, delimiter="|")
+        writer.writeheader()
+        writer.writerows(rows)
+    temporary.replace(output)
+    return updated
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
@@ -394,6 +430,7 @@ def main() -> None:
     phone_labels.save()
 
     source_rows = read_source_rows(args.data_dir, excluded_path=args.output)
+    refreshed_prices = refresh_missing_output_prices(args.output, source_rows)
     existing = load_existing_identities(args.output)
     new_rows = select_new_rows(source_rows, existing)
 
@@ -404,6 +441,8 @@ def main() -> None:
     )
     if backfilled:
         print(f"Backfilled phone types for {backfilled} existing ads.")
+    if refreshed_prices:
+        print(f"Refreshed prices for {refreshed_prices} existing combined ads.")
     if new_rows:
         validate_codex_auth()
     for start in range(0, len(new_rows), args.batch_size):

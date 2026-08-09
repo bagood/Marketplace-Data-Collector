@@ -35,20 +35,19 @@ and collects whatever initial results Facebook makes available. Existing links
 are loaded from the file, so only newly discovered listings are added across
 separate runs.
 
-After collecting the initial links, the scraper opens each ad not already in
-`data/facebook_marketplace_ads.csv` and saves its details using the same
-pipe-delimited layout as the OLX export:
+After collecting links, the scraper opens ads that are not already present in
+`data/facebook_marketplace_ads.csv` and stores this pipe-delimited schema:
 
 ```text
 link|title|price|description|timestamp
 ```
 
-Rows are deduplicated by canonical listing URL and written only by the parent
-process to keep the CSV safe from concurrent writes. Use `--csv-output` to
-choose a different CSV file.
+It collects each ad's title and full description. Because Facebook Marketplace
+does not expose a dependable price to this scraper, `price` is always saved as
+`NaN`. Existing CSV rows are deduplicated by canonical listing URL.
 
-Ad detail pages are processed in parallel using four Chrome worker processes by
-default. Adjust this based on available memory and CPU:
+Detail pages use four Chrome worker processes by default. This can be changed
+with `--detail-workers`:
 
 ```bash
 python scrapperScripts/facebook_marketplace_scraper.py --detail-workers 2
@@ -86,14 +85,10 @@ with Facebook's terms and applicable rate limits.
 
 ## OLX scraper
 
-`olx_scraper.py` opens the configured Jakarta iPhone search, scrolls to the
-bottom, repeatedly clicks **Muat Lainnya**, and stores unique `/item/` links in
-`links/olx_item_links.txt`. It merges only newly discovered ads into the file across
-separate runs. Every run performs exactly
-five successful **Muat Lainnya** clicks by default before extraction starts. The configured
-number is exact, so the scraper stops clicking immediately after reaching it. The button is
-located using its `data-aut-id="btnLoadMore"` attribute. Link collection happens
-only after result expansion is complete.
+`olx_scraper.py` opens the configured Jakarta iPhone search and stores the
+unique `/item/` links currently visible in `links/olx_item_links.txt`. It does
+not scroll or click **Muat Lainnya**. Newly discovered ads are merged into the
+link file across separate runs.
 
 After URL collection, the scraper opens every ad that is not already present
 in `data/olx_ads.csv` and stores its details using these columns:
@@ -114,12 +109,6 @@ python scrapperScripts/olx_scraper.py --detail-workers 2
 
 ```bash
 python scrapperScripts/olx_scraper.py
-```
-
-The minimum can be increased when needed:
-
-```bash
-python scrapperScripts/olx_scraper.py --min-load-more-clicks 10
 ```
 
 ## Data analysis
