@@ -16,6 +16,7 @@ from analyzeData.analyze_data import (
     normalize_output_schema,
     refresh_missing_output_prices,
     select_new_rows,
+    sort_output_by_timestamp,
     validate_codex_auth,
 )
 
@@ -53,6 +54,39 @@ class AnalyzeDataIncrementalTest(unittest.TestCase):
         self.assertEqual(list(rows[0]), list(OUTPUT_FIELDS))
         self.assertEqual([row["link"] for row in rows], [first["link"], second["link"]])
 
+    def test_append_sorts_complete_output_by_timestamp_earliest_first(self) -> None:
+        latest = self.row("https://example/latest")
+        latest["timestamp"] = "2026-01-02T00:00:00+07:00"
+        earliest = self.row("https://example/earliest")
+        earliest["timestamp"] = "2026-01-01T23:00:00+07:00"
+
+        append_output(self.output, [latest])
+        append_output(self.output, [earliest])
+
+        with self.output.open(encoding="utf-8", newline="") as handle:
+            rows = list(csv.DictReader(handle, delimiter="|"))
+        self.assertEqual(
+            [row["link"] for row in rows],
+            [earliest["link"], latest["link"]],
+        )
+
+    def test_sort_compares_timezone_offsets_and_places_invalid_values_last(self) -> None:
+        later_in_utc = self.row("https://example/later")
+        later_in_utc["timestamp"] = "2026-01-01T09:00:00+07:00"
+        earlier_in_utc = self.row("https://example/earlier")
+        earlier_in_utc["timestamp"] = "2025-12-31T20:00:00-05:00"
+        invalid = self.row("https://example/invalid")
+        invalid["timestamp"] = "unknown"
+        append_output(self.output, [invalid, later_in_utc, earlier_in_utc])
+
+        self.assertFalse(sort_output_by_timestamp(self.output))
+        with self.output.open(encoding="utf-8", newline="") as handle:
+            rows = list(csv.DictReader(handle, delimiter="|"))
+        self.assertEqual(
+            [row["link"] for row in rows],
+            [earlier_in_utc["link"], later_in_utc["link"], invalid["link"]],
+        )
+
     def test_existing_identity_does_not_depend_on_description(self) -> None:
         append_output(self.output, [self.row("https://example/1", "Old description")])
         identities = load_existing_identities(self.output)
@@ -88,8 +122,12 @@ class AnalyzeDataIncrementalTest(unittest.TestCase):
             reader = csv.DictReader(handle, delimiter="|")
             rows = list(reader)
         self.assertEqual(tuple(reader.fieldnames or ()), OUTPUT_FIELDS)
-        self.assertEqual(rows[0]["timestamp"], "")
-        self.assertEqual(rows[1]["timestamp"], "2026-01-01T00:00:00+07:00")
+        rows_by_link = {row["link"]: row for row in rows}
+        self.assertEqual(rows_by_link["https://example/1"]["timestamp"], "")
+        self.assertEqual(
+            rows_by_link["https://example/2"]["timestamp"],
+            "2026-01-01T00:00:00+07:00",
+        )
 
     def test_phone_type_is_extracted_from_title_with_canonical_casing(self) -> None:
         cases = {

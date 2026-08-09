@@ -15,6 +15,8 @@ class CollectDataTest(unittest.TestCase):
             model="test-model",
             batch_size=10,
             timeout=60.0,
+            google_spreadsheet_id="spreadsheet-123",
+            google_worksheet="Phone Ads",
         )
 
     def test_commands_include_both_scrapers_and_analyzer(self) -> None:
@@ -23,6 +25,10 @@ class CollectDataTest(unittest.TestCase):
         self.assertIn("--headless", scrapers["facebook"])
         self.assertIn("--headless", scrapers["olx"])
         self.assertIn("analyze_data.py", " ".join(analyzer))
+        self.assertIn("--google-spreadsheet-id", analyzer)
+        self.assertIn("spreadsheet-123", analyzer)
+        self.assertIn("--google-worksheet", analyzer)
+        self.assertIn("Phone Ads", analyzer)
 
     @patch("collect_analyze_data.subprocess.run")
     @patch("collect_analyze_data.run_scrapers")

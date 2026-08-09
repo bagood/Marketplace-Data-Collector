@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unicodedata
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -295,17 +296,56 @@ def rate_batch_with_codex(
 
 
 def append_output(output: Path, rows: list[dict[str, str]]) -> None:
-    """Append newly rated rows, creating the output and header when necessary."""
+    """Append newly rated rows and keep the complete output chronologically sorted."""
     if not rows:
         return
     output.parent.mkdir(parents=True, exist_ok=True)
     normalize_output_schema(output)
-    needs_header = not output.exists() or output.stat().st_size == 0
-    with output.open("a", encoding="utf-8", newline="") as file:
+    existing_rows: list[dict[str, str]] = []
+    if output.exists() and output.stat().st_size:
+        with output.open("r", encoding="utf-8-sig", newline="") as file:
+            existing_rows = list(csv.DictReader(file, delimiter="|"))
+
+    combined_rows = sorted([*existing_rows, *rows], key=_timestamp_sort_key)
+    temporary = output.with_suffix(output.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=OUTPUT_FIELDS, delimiter="|")
-        if needs_header:
-            writer.writeheader()
-        writer.writerows(rows)
+        writer.writeheader()
+        writer.writerows(combined_rows)
+    temporary.replace(output)
+
+
+def _timestamp_sort_key(row: dict[str, str]) -> tuple[int, datetime]:
+    """Sort valid ISO timestamps by instant, with missing/invalid values last."""
+    value = row.get("timestamp", "").strip()
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return (1, datetime.max.replace(tzinfo=timezone.utc))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return (0, parsed.astimezone(timezone.utc))
+
+
+def sort_output_by_timestamp(output: Path) -> bool:
+    """Atomically sort a combined output CSV from earliest timestamp to latest."""
+    if not output.exists() or output.stat().st_size == 0:
+        return False
+    normalize_output_schema(output)
+    with output.open("r", encoding="utf-8-sig", newline="") as file:
+        rows = list(csv.DictReader(file, delimiter="|"))
+
+    sorted_rows = sorted(rows, key=_timestamp_sort_key)
+    if rows == sorted_rows:
+        return False
+
+    temporary = output.with_suffix(output.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=OUTPUT_FIELDS, delimiter="|")
+        writer.writeheader()
+        writer.writerows(sorted_rows)
+    temporary.replace(output)
+    return True
 
 
 def normalize_output_schema(output: Path) -> None:
@@ -464,6 +504,9 @@ def main() -> None:
         print("No new ads to rate or append.")
     else:
         print(f"Appended {len(new_rows)} newly rated ads to {args.output}")
+
+    if sort_output_by_timestamp(args.output):
+        print(f"Sorted {args.output} by timestamp from earliest to latest.")
 
     if args.google_spreadsheet_id.strip():
         upload_result = upload_csv_to_google_sheets(

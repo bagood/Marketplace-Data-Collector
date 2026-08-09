@@ -167,7 +167,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--detail-workers",
         type=int,
-        default=4,
+        default=1,
         help="Chrome worker processes used to scrape ad details",
     )
     parser.add_argument("--headless", action="store_true", help="Run Chrome headlessly")

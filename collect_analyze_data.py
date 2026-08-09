@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 import time
@@ -21,6 +22,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default="gpt-5.5", help="Codex model used by the analyzer")
     parser.add_argument("--batch-size", type=int, default=20)
     parser.add_argument("--timeout", type=float, default=300.0)
+    parser.add_argument(
+        "--google-spreadsheet-id",
+        default=os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID", ""),
+        help="Upload the sorted combined CSV to this spreadsheet after analysis",
+    )
+    parser.add_argument(
+        "--google-worksheet",
+        default=os.getenv("GOOGLE_SHEETS_WORKSHEET", "Ads"),
+        help="Target Google Sheets worksheet title (default: Ads)",
+    )
     return parser.parse_args()
 
 
@@ -55,6 +66,16 @@ def build_commands(args: argparse.Namespace) -> tuple[dict[str, list[str]], list
         "--timeout",
         str(args.timeout),
     ]
+    spreadsheet_id = getattr(args, "google_spreadsheet_id", "").strip()
+    if spreadsheet_id:
+        analyzer.extend(
+            [
+                "--google-spreadsheet-id",
+                spreadsheet_id,
+                "--google-worksheet",
+                getattr(args, "google_worksheet", "Ads"),
+            ]
+        )
     return scrapers, analyzer
 
 

@@ -64,6 +64,11 @@ def build_driver(
             """
         },
     )
+
+    # options = Options()
+    # options.add_argument("--incognito")
+    # driver = webdriver.Chrome(options=options)
+
     return driver
 
 

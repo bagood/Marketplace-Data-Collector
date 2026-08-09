@@ -123,7 +123,9 @@ variants such as `IPhone 11` reuse the documented `iPhone 11` label. An ad is
 considered already processed when its `link` is present in
 `data/combined_rated_ads.csv`. Existing ads are not rated again; newly rated ads
 are appended to the pipe-delimited combined output after each successful batch.
-The combined output is excluded from input scans.
+The complete output is atomically sorted by timestamp from earliest to latest;
+rows with missing or invalid timestamps remain at the end. The combined output
+is excluded from input scans.
 
 The combined output columns are:
 
@@ -142,9 +144,11 @@ documented `Unknown` label.
 
 ### Google Sheets upload
 
-The analyzer can replace a Google Sheets worksheet with the complete combined
-CSV after analysis. Enable the Google Sheets API, create a service account, and
-share the destination spreadsheet with that service account as an editor.
+The collect/analyze service automatically replaces a Google Sheets worksheet
+with the complete, chronologically sorted combined CSV after analysis whenever
+`GOOGLE_SHEETS_SPREADSHEET_ID` is configured. The analyzer supports the same
+upload when run directly. Enable the Google Sheets API, create a service account,
+and share the destination spreadsheet with that service account as an editor.
 
 Encode the downloaded service-account JSON as a single Base64 line. This avoids
 multiline private-key parsing problems in `.env`:
